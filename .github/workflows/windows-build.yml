@@ -39,22 +39,70 @@ jobs:
             binutils-mingw-w64-x86-64 \
             zip \
             unzip \
-            file
+            file \
+            curl \
+            jq \
+            tar \
+            libvulkan-dev
 
       - name: Verify cross compiler
         run: |
           x86_64-w64-mingw32-gcc-posix --version
           x86_64-w64-mingw32-g++-posix --version
 
-      - name: Build rood-boi
+      - name: Fetch latest stable SDL3
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDL_TAG="$(curl -fsSL https://api.github.com/repos/libsdl-org/SDL/releases/latest | jq -er '.tag_name')"
+          if [[ ! "$SDL_TAG" =~ ^release-3\. ]]; then
+            echo "::error::Unexpected SDL3 stable release tag: $SDL_TAG"
+            exit 1
+          fi
+
+          echo "Building with official SDL3 release: $SDL_TAG"
+          curl -fL "https://github.com/libsdl-org/SDL/archive/refs/tags/${SDL_TAG}.tar.gz" \
+            -o /tmp/SDL3.tar.gz
+
+          rm -rf pc/third_party/SDL3
+          mkdir -p pc/third_party/SDL3
+          tar -xzf /tmp/SDL3.tar.gz --strip-components=1 -C pc/third_party/SDL3
+
+      - name: Build rood-boi with fresh MinGW-w64 SDL3
         env:
           ROOD_DEBUG_COMPRESS: zlib
+        shell: bash
         run: |
+          set -euo pipefail
+
+          # Force a fresh Windows SDL3 build even if this runner has a cache.
+          CACHE_ROOT="${ROOD_BUILD_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/rood-boi}"
+          if [[ -d "$CACHE_ROOT/third-party" ]]; then
+            find "$CACHE_ROOT/third-party" -maxdepth 1 -type d \
+              -name 'sdl3-windows-*' -exec rm -rf {} +
+          fi
+
           python3 pc/tools/build_boot.py \
             --target windows \
             --arch 64 \
+            --coff \
             --battle \
             --verbose
+
+      - name: Verify fresh Windows SDL3 linkage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDL_LIB="$(python3 -c 'import json; print(json.load(open("pc/build/win64/third-party.json"))["sdl_win"])')"
+          test -s "$SDL_LIB"
+          test -s pc/build/win64/rood.exe
+
+          echo "Fresh MinGW-w64 SDL3 archive: $SDL_LIB"
+          file "$SDL_LIB"
+          echo "Executable:"
+          file pc/build/win64/rood.exe
 
       - name: Verify executable
         run: |
