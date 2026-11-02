@@ -1,0 +1,270 @@
+
+name: Build rood-boi Windows x64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rood-boi-windows-build
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Build Windows x64
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            python3 \
+            python3-pip \
+            python3-venv \
+            mingw-w64 \
+            gcc-mingw-w64-x86-64-posix \
+            g++-mingw-w64-x86-64-posix \
+            binutils-mingw-w64-x86-64 \
+            zip \
+            unzip \
+            file
+
+      - name: Verify cross compiler
+        run: |
+          x86_64-w64-mingw32-gcc-posix --version
+          x86_64-w64-mingw32-g++-posix --version
+
+      - name: Build rood-boi
+        env:
+          ROOD_DEBUG_COMPRESS: zlib
+        run: |
+          python3 pc/tools/build_boot.py \
+            --target windows \
+            --arch 64 \
+            --battle \
+            --verbose
+
+      - name: Verify executable
+        run: |
+          set -eux
+
+          test -s pc/build/win64/rood.exe
+
+          file pc/build/win64/rood.exe
+
+          x86_64-w64-mingw32-objdump \
+            -f pc/build/win64/rood.exe
+
+      - name: Prepare package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist/rood-boi
+          cp -a pc/build/win64/. dist/rood-boi/
+
+          test -s dist/rood-boi/rood.exe
+
+      - name: Collect and verify DLL dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OBJDUMP=x86_64-w64-mingw32-objdump
+          GCC=x86_64-w64-mingw32-gcc-posix
+          GXX=x86_64-w64-mingw32-g++-posix
+          PACKAGE="$PWD/dist/rood-boi"
+
+          # Windows-provided DLLs do not belong in the package.
+          SYSTEM_DLLS="
+          kernel32.dll kernelbase.dll ntdll.dll
+          user32.dll gdi32.dll gdi32full.dll
+          advapi32.dll sechost.dll shell32.dll
+          ole32.dll oleaut32.dll combase.dll
+          comdlg32.dll comctl32.dll
+          winmm.dll ws2_32.dll wsock32.dll
+          version.dll bcrypt.dll bcryptprimitives.dll
+          crypt32.dll secur32.dll shlwapi.dll
+          setupapi.dll imm32.dll uxtheme.dll
+          dwmapi.dll rpcrt4.dll msvcrt.dll
+          ucrtbase.dll
+          "
+
+          declare -A SEEN=()
+
+          is_system_dll() {
+            local name="${1,,}"
+
+            [[ " $SYSTEM_DLLS " == *" $name "* ]] && return 0
+
+            # Windows API-set contracts are provided by Windows.
+            [[ "$name" == api-ms-win-*.dll ]] && return 0
+            [[ "$name" == ext-ms-win-*.dll ]] && return 0
+
+            return 1
+          }
+
+          is_x64_pe() {
+            local description
+
+            description="$("$OBJDUMP" -f "$1" 2>/dev/null || true)"
+
+            [[ "$description" == *"architecture: i386:x86-64"* ]]
+          }
+
+          find_existing_dll() {
+            local name="$1"
+
+            find "$PACKAGE" -type f -iname "$name" -print -quit
+          }
+
+          find_runtime_dll() {
+            local name="$1"
+            local candidate
+
+            # Ask both compiler drivers for the exact runtime location.
+            for compiler in "$GCC" "$GXX"; do
+              candidate="$("$compiler" -print-file-name="$name")"
+
+              if [[ "$candidate" != "$name" && -f "$candidate" ]]; then
+                if is_x64_pe "$candidate"; then
+                  echo "$candidate"
+                  return 0
+                fi
+              fi
+            done
+
+            # Search only architecture-specific MinGW locations.
+            while IFS= read -r candidate; do
+              if is_x64_pe "$candidate"; then
+                echo "$candidate"
+                return 0
+              fi
+            done < <(
+              find \
+                /usr/x86_64-w64-mingw32 \
+                /usr/lib/gcc/x86_64-w64-mingw32 \
+                -type f -iname "$name" -print 2>/dev/null
+            )
+
+            return 1
+          }
+
+          # Queue every executable and DLL in the package.
+          mapfile -d '' QUEUE < <(
+            find "$PACKAGE" -type f \
+              \( -iname '*.exe' -o -iname '*.dll' \) \
+              -print0
+          )
+
+          if [[ "${#QUEUE[@]}" -eq 0 ]]; then
+            echo "::error::No Windows executables or DLLs found."
+            exit 1
+          fi
+
+          INDEX=0
+
+          while (( INDEX < ${#QUEUE[@]} )); do
+            CURRENT="${QUEUE[$INDEX]}"
+            INDEX=$((INDEX + 1))
+
+            [[ -f "$CURRENT" ]] || continue
+
+            if ! is_x64_pe "$CURRENT"; then
+              echo "::error::Unexpected or invalid PE architecture: $CURRENT"
+              exit 1
+            fi
+
+            echo "Scanning: ${CURRENT#$PACKAGE/}"
+
+            while IFS= read -r DLL; do
+              DLL="${DLL,,}"
+
+              [[ -z "$DLL" ]] && continue
+
+              if is_system_dll "$DLL"; then
+                continue
+              fi
+
+              [[ "${SEEN[$DLL]+yes}" ]] && continue
+              SEEN["$DLL"]=1
+
+              EXISTING="$(find_existing_dll "$DLL" || true)"
+
+              if [[ -n "$EXISTING" ]]; then
+                if ! is_x64_pe "$EXISTING"; then
+                  echo "::error::Wrong architecture for packaged DLL: $DLL"
+                  exit 1
+                fi
+
+                QUEUE+=("$EXISTING")
+                continue
+              fi
+
+              FOUND="$(find_runtime_dll "$DLL" || true)"
+
+              if [[ -z "$FOUND" ]]; then
+                echo "::error::Unresolved Windows DLL dependency: $DLL"
+                exit 1
+              fi
+
+              echo "Bundling x64 dependency: $DLL"
+
+              DESTINATION="$PACKAGE/$DLL"
+
+              cp "$FOUND" "$DESTINATION"
+              QUEUE+=("$DESTINATION")
+
+            done < <(
+              "$OBJDUMP" -p "$CURRENT" |
+                awk '/DLL Name:/ {print $3}'
+            )
+          done
+
+          echo "All detected DLL dependencies resolved."
+
+      - name: Final package verification
+        run: |
+          set -eux
+
+          test -s dist/rood-boi/rood.exe
+
+          echo "=== Executable architecture ==="
+          file dist/rood-boi/rood.exe
+
+          echo "=== Packaged DLLs ==="
+          find dist/rood-boi -type f -iname '*.dll' \
+            -printf '%P\n' | sort
+
+          echo "=== Package contents ==="
+          find dist/rood-boi -type f \
+            -printf '%P\n' | sort
+
+      - name: Create ZIP
+        run: |
+          cd dist
+          zip -r -9 ../rood-boi-Windows-x64.zip rood-boi
+          cd ..
+
+          sha256sum rood-boi-Windows-x64.zip
+          ls -lh rood-boi-Windows-x64.zip
+
+      - name: Upload Windows x64 build
+        uses: actions/upload-artifact@v4
+        with:
+          name: rood-boi-Windows-x64
+          path: rood-boi-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30
