@@ -43,7 +43,8 @@ jobs:
             curl \
             jq \
             tar \
-            libvulkan-dev
+            libvulkan-dev \
+            binutils-mipsel-linux-gnu
 
       - name: Verify cross compiler
         run: |
@@ -68,6 +69,22 @@ jobs:
           rm -rf pc/third_party/SDL3
           mkdir -p pc/third_party/SDL3
           tar -xzf /tmp/SDL3.tar.gz --strip-components=1 -C pc/third_party/SDL3
+
+      - name: Install pinned Zig toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 pc/tools/zig_toolchain.py --fetch
+          ZIG_BIN="$(python3 pc/tools/zig_toolchain.py)"
+          "$ZIG_BIN" version
+
+      - name: Verify MIPS binutils
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v mipsel-linux-gnu-ld
+          command -v mipsel-linux-gnu-objcopy
+          mipsel-linux-gnu-ld --version | head -n 1
 
       - name: Build rood-boi with fresh MinGW-w64 SDL3
         env:
